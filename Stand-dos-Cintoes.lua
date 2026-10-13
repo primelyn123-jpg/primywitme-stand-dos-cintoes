@@ -842,11 +842,6 @@ local S = {
   lastWorld = nil, lastOwnerFrame = nil,
   lastCommand = "none", controls = {}, sliders = {},
 }
--- A blank prefix makes every chat command dead (".i" is read as a command
--- named ".i"), and one had been saved for several accounts without anyone
--- choosing it. So a saved blank only counts when the loader asks for it with
--- _G.PREFIX = "" this time; otherwise it is the shipped ".".
-if S.prefix == "" and not (Core and Core.config and Core.config.PREFIX == "") then S.prefix = "." end
 if not table.find(STANCES, S.stance) then S.stance = "Fighting stance" end
 if not table.find(APPROACH_NAMES, S.approachPreset) then S.approachPreset = "Behind" end
 if not table.find(FACINGS, S.facing) then S.facing = "Face them" end
@@ -2950,6 +2945,11 @@ function S.handle(message, fromUI)
   if not word then return false end
   word = word:lower()
   local entry = LOOKUP[word]
+  -- with no prefix, ".i" (old habit) works the same as "i"
+  if not entry and prefix == "" and word:match("^%p%w") then
+    word = word:sub(2)
+    entry = LOOKUP[word]
+  end
   if not entry then return false end
   S.lastCommand = prefix .. word .. (rest ~= "" and (" " .. rest) or "")
   emit("command", word, rest, fromUI == true)
@@ -6585,11 +6585,10 @@ do
     end
 
     card("the stand")
-    U.input(row("Command prefix", "Typed before every command. Press Enter to save. Blank (bare words) only with Enter on an empty box."), { value = S.prefix, mono = true, size = UDim2.fromOffset(120, 32),
-      onCommit = function(v, enter)
+    U.input(row("Command prefix", "Typed before every command. Blank means bare words: i, a, s... (.i still works too)."), { value = S.prefix, mono = true, size = UDim2.fromOffset(120, 32),
+      onCommit = function(v)
         v = tostring(v or ""):gsub("%s", "")
-        -- clicking in and out of the box used to save whatever it held, blank included
-        if v == S.prefix or (v == "" and not enter) then return end
+        if v == S.prefix then return end
         local old = S.prefix
         Core.setPrefix(v)
         U.remember("prefix", function() Core.setPrefix(old) end)
