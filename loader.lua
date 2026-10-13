@@ -2,7 +2,7 @@
 _G.HOST_USERNAME     = "YourMainAccount" -- your main account (wrong capitals or a display name still work)
 _G.PREFIX            = "."      -- chat command prefix
 _G.MESSAGES          = false    -- stands talk in chat
-_G.GUI               = false    -- open the console at load (.gui opens it any time)
+_G.GUI               = true     -- open the console at load (.gui toggles it any time)
 _G.BLACK_SCREEN      = true     -- black stats screen + 3D off on the alt (F6 or .black toggles it)
 _G.ANTI_AFK          = true     -- never get kicked for idling
 _G.HUNT_DISTANCE     = 7.4      -- studs from the prey (.dist 5 changes it live)

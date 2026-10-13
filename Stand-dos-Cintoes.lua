@@ -95,7 +95,7 @@ end
 -- standcore/loader.lua, baked in here by the build. So a bare loadstring with
 -- only the host set runs exactly the config the loader spells out, and so does
 -- everyone else. A saved setting or a _G line still wins over these.
-local DEFAULTS = { PREFIX = ".", MESSAGES = false, GUI = false, BLACK_SCREEN = true, ANTI_AFK = true, HUNT_DISTANCE = 7.4, HUNT_FROM = "Behind", MAX_STANDS = 4, YIELD = true, HUNT_WITHOUT_HOST = true, FOLLOW_SPEED = 1, OFFSET_RIGHT = 3, OFFSET_UP = 2.5, OFFSET_BACK = 4, ASSETS = "https://raw.githubusercontent.com/Mrzaytoon/stand-dos-cintoes/main/StandDosCintoes/" }
+local DEFAULTS = { PREFIX = ".", MESSAGES = false, GUI = true, BLACK_SCREEN = true, ANTI_AFK = true, HUNT_DISTANCE = 7.4, HUNT_FROM = "Behind", MAX_STANDS = 4, YIELD = true, HUNT_WITHOUT_HOST = true, FOLLOW_SPEED = 1, OFFSET_RIGHT = 3, OFFSET_UP = 2.5, OFFSET_BACK = 4, ASSETS = "https://raw.githubusercontent.com/Mrzaytoon/stand-dos-cintoes/main/StandDosCintoes/" }
 local HOUSE = {}
 Core.defaults = DEFAULTS
 function Cfg.feat(id, default)
@@ -149,7 +149,7 @@ do
     MAX_STANDS = { "maxHunters", "number" }, YIELD = { "yield", "boolean" }, HUNT_WITHOUT_HOST = { "huntAlone", "boolean" },
     VOID_CARRY = { "combo", "boolean" }, DASH = { "dashSpam", "boolean" }, SKILLS = { "useSkills", "boolean" },
     M1 = { "useM1", "boolean" }, AUTO_ULT = { "autoUlt", "boolean" }, CAMERA = { "camera", "boolean" },
-    DEEP_HIDE = { "hideDeep", "boolean" }, LOW_HP = { "lowHP", "number" }, SQUAD = { "squad.on", "boolean" },
+    DEEP_HIDE = { "hideDeep", "boolean" }, INVISIBLE = { "invisible", "boolean" }, LOW_HP = { "lowHP", "number" }, SQUAD = { "squad.on", "boolean" },
   }
   local PRESETS = { "Behind", "Behind left", "Behind right", "Left flank", "Right flank", "In front", "Above", "Below", "Point blank" }
   for key, spec in pairs(KEYS) do
@@ -186,14 +186,97 @@ do
 end
 
 -- ---------------------------------------------------------------- K, R, T
--- No Rep Root fling engine here: fling assist reports that and does nothing.
-local K = { whitelist = {}, cfg = {}, flinging = false }
+local K = { whitelist = {}, cfg = { flingDuration = 2.5 }, flinging = false }
 local R = { repRoot = true, fling = false, voidOriginal = workspace.FallenPartsDestroyHeight }
 function R.validPosition(v)
   return v.X == v.X and v.Y == v.Y and v.Z == v.Z
     and math.abs(v.X) < math.huge and math.abs(v.Y) < math.huge and math.abs(v.Z) < math.huge
 end
-function R.runOne() return false, "StandCore has no Rep Root fling" end
+
+-- The fling: our own unlatched body sits inside the target's root with a huge
+-- velocity at replication time (set on Heartbeat) and none during our own
+-- physics step (cleared on RenderStepped), so they get thrown and we do not.
+-- The stand's latch steps aside while it runs (fling assist blocks it).
+local FLING_SPEED, FLING_SPIN, FLUNG_SPEED, FLUNG_RISE = 9e4, 9e4, 250, 120
+-- offsets inside their body, cycled every frame so the contact is always fresh
+local FLING_JITTER = { Vector3.new(0, 0, 0), Vector3.new(0, -1.5, 0), Vector3.new(0.8, 0.5, 0), Vector3.new(-0.8, 0.5, 0),
+  Vector3.new(0, 0.5, 0.8), Vector3.new(0, 0.5, -0.8) }
+-- Ping prediction. What we see of them is already late (their upload, our
+-- download, the interpolation buffer) and where we put ourselves reaches their
+-- screen late again, so we aim the whole round trip ahead along their path.
+-- The lead is swept around the estimate every frame, so a ping guess that is
+-- off still crosses them somewhere on the path.
+local FLING_INTERP, FLING_LEAD_MAX, FLING_HISTORY, FLING_WALK_MAX = 0.1, 0.6, 0.25, 150
+local FLING_SWEEP = { 1, 0.6, 1.4, 0.8, 1.2, 1.6, 0.4 }
+function R.runOne(name)
+  if K.flinging then return false, "already flinging" end
+  local target = Players:FindFirstChild(name or "")
+  if not target then return false, "no such player" end
+  local body = R.TSB and R.TSB.Game and R.TSB.Game.body or function(p)
+    local m = p.Character
+    local h = m and m:FindFirstChildOfClass("Humanoid")
+    return m, h, h and h.RootPart
+  end
+  K.flinging = true
+  local RS = game:GetService("RunService")
+  -- let the latch's own release run first, then make sure the binding is gone
+  RS.Heartbeat:Wait(); RS.Heartbeat:Wait()
+  local char, hum, root = body(LP)
+  local collide = {}
+  local ok, why = pcall(function()
+    if not root then error("no character") end
+    local shp = rawget(getgenv(), "sethiddenproperty")
+    if shp then pcall(shp, root, "PhysicsRepRootPart", nil) end
+    local home = root.CFrame
+    -- the body parts that touch other players; the humanoid turns limbs back
+    -- off every step, so collision is re-forced every frame below
+    local parts = {}
+    for _, part in ipairs(char:GetChildren()) do
+      if part:IsA("BasePart") and part.CanTouch then collide[part] = part.CanCollide; parts[#parts + 1] = part end
+    end
+    local history, walk = {}, Vector3.zero
+    local deadline, flungAt, frame = os.clock() + math.max(K.cfg.flingDuration or 2.5, 0.3), nil, 0
+    while os.clock() < deadline and char.Parent and hum.Health > 0 do
+      local _, targetHum, targetRoot = body(target)
+      if not targetRoot or not targetHum or targetHum.Health <= 0 then break end
+      local now, here, replicated = os.clock(), targetRoot.Position, targetRoot.AssemblyLinearVelocity
+      -- thrown: far faster than anyone moves, or shot upward
+      if replicated.Magnitude >= FLUNG_SPEED or replicated.Y >= FLUNG_RISE then flungAt = flungAt or now end
+      if flungAt and now - flungAt > 0.25 then break end
+      -- their velocity from where they actually went over the last quarter
+      -- second, blended with the replicated one (noisy frame to frame)
+      history[#history + 1] = { now, here }
+      while #history > 2 and now - history[1][1] > FLING_HISTORY do table.remove(history, 1) end
+      local velocity = replicated
+      local span = now - history[1][1]
+      if span >= 0.05 then velocity = ((here - history[1][2]) / span) * 0.6 + replicated * 0.4 end
+      -- a body already flying is not walking: keep predicting from the last walk
+      if velocity.Magnitude <= FLING_WALK_MAX then walk = velocity end
+      local rtt = 0.1
+      pcall(function() rtt = LP:GetNetworkPing() end)
+      local lead = math.clamp(rtt * 2 + FLING_INTERP, 0.05, FLING_LEAD_MAX)
+      frame += 1
+      -- jumps are short and fall back: half weight on the vertical
+      local path = Vector3.new(walk.X, walk.Y * 0.5, walk.Z) * lead * FLING_SWEEP[frame % #FLING_SWEEP + 1]
+      local spot = here + path + FLING_JITTER[frame % #FLING_JITTER + 1]
+      if not R.validPosition(spot) or spot.Y < -400 then break end
+      for _, part in ipairs(parts) do if part.Parent then part.CanCollide = true end end
+      root.CFrame = CFrame.new(spot) * CFrame.Angles(math.rad(frame * 37 % 360), math.rad(frame * 53 % 360), 0)
+      root.AssemblyLinearVelocity = Vector3.new(FLING_SPEED, FLING_SPEED * 2, FLING_SPEED)
+      root.AssemblyAngularVelocity = Vector3.new(FLING_SPIN, FLING_SPIN, FLING_SPIN)
+      RS.RenderStepped:Wait()
+      root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+      RS.Heartbeat:Wait()
+    end
+    root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
+    if R.validPosition(home.Position) and home.Position.Y > -400 then root.CFrame = home end
+    return flungAt ~= nil
+  end)
+  for part, was in pairs(collide) do pcall(function() part.CanCollide = was end) end
+  K.flinging = false
+  if not ok then return false, why end
+  return true, why and "flung" or "they did not move"
+end
 local T = { c = { accent = Color3.fromRGB(255, 196, 92) } }
 local C = nil -- no Giorgio interface; S.build is never called here
 
@@ -731,6 +814,7 @@ local S = {
   orbitOn = flag("orbit", false), orbitSpeed = number("orbitSpeed", 2, -20, 20), orbitHeight = number("orbitHeight", 3, -10, 20),
   previewAngles = flag("previewAngles", true), previewWho = text("previewWho", ""),
   -- the deep hide
+  invisible = flag("invisible", false),
   hideDeep = flag("hideDeep", true), hideDepth = number("hideDepth", 900, 60, 1500),  -- MEASURED 2026-09-30: a stand hidden at 4040 died there
   hideAway = number("hideAway", 250, 0, 2000), voidAt = 0, voidReady = false,
   -- the grab carry
@@ -743,7 +827,7 @@ local S = {
   -- attempt budget holds however the next grab gets started.
   attempts = { target = nil, body = nil, n = 0 },
   flingAssist = flag("flingAssist", false), flingBelow = number("flingBelow", 40, 1, 100),
-  flingEvery = number("flingEvery", 10, 2, 60), flingDrive = number("flingDrive", 1.2, 0.3, 6),
+  flingEvery = number("flingEvery", 10, 2, 60), flingDrive = number("flingDrive", 2.5, 0.3, 6),
   flingBusy = false, lastFling = -math.huge,
   speak = flag("speak", true),
   lines = {
@@ -875,17 +959,22 @@ local function refreshSquad()
   local engaging = now - S.engageAt < Q.ENGAGE
   local set, strike, idle = {}, { LP }, { LP }
   table.clear(Q.hunterAnchor)
+  local myCode = Q.beaconCode and Q.beaconCode() or nil
   for _, p in ipairs(Players:GetPlayers()) do
     if p ~= LP and p ~= S.owner then
       local named = names[p.Name:lower()] == true
       local anchor = S.squadAuto and latchedTo(p) or nil
       local onOwner = anchor ~= nil and anchor == ownerRoot
       local onTarget = anchor ~= nil and anchor == targetRoot
+      -- the beacon finds a stand whether or not it is latched right now
+      local beacon = S.squadAuto and Q.beaconOf and Q.beaconOf(p) or nil
+      local mate = beacon ~= nil and beacon == myCode
       if onTarget then Q.seenOnTarget[p] = now; Q.hunterAnchor[p] = anchor; Q.watchMate(p) end
       local recent = Q.seenOnTarget[p] ~= nil and now - Q.seenOnTarget[p] < Q.GRACE and (onOwner or onTarget)
-      if named or onOwner or onTarget or (anchor ~= nil and anchor == S.anchorRoot) then set[p] = true end
-      if named or onTarget or recent or (engaging and onOwner) then strike[#strike + 1] = p end
-      if named or onOwner then idle[#idle + 1] = p end
+      -- any stand, ours or another owner's, is never a target
+      if named or onOwner or onTarget or beacon ~= nil or (anchor ~= nil and anchor == S.anchorRoot) then set[p] = true end
+      if named or onTarget or recent or (engaging and (onOwner or mate)) then strike[#strike + 1] = p end
+      if named or onOwner or mate then idle[#idle + 1] = p end
     end
   end
   local function byId(a, b) return a.UserId < b.UserId end
@@ -1615,16 +1704,126 @@ local function hold(frame, anchorRoot, poseName, ch, hum, root)
 end
 
 Q.SMOOTHED = { Idle = true, Front = true, Strike = true }
+
+-- Invisible, the way Revenant does it (measured 2026-10-13 by watching
+-- Revenant's invis from another client): play one animation frozen on a
+-- frame that nudges the torso, at a weight of two billion. Track weights
+-- replicate, so every other screen multiplies that nudge into ~3,770 studs and
+-- draws the body ~500 studs under the map, while the root -- the part the
+-- latch writes and the server hits from -- never moves. Measured on the stand,
+-- latched and hunting: the target saw the body thrown off in 60/65 samples
+-- and the stand still landed 24 hits and a kill in 20 s.
+-- Two dead ends first: detaching the body from the root (the latch carries the
+-- whole body on the root, so the owner saw every limb) and standing inside the
+-- floor (the latch offset swings out of the ground whenever the target tumbles
+-- or jumps, and hits stop past ~8 studs under them).
+Q.INVIS_ANIM, Q.INVIS_AT, Q.INVIS_WEIGHT = "rbxassetid://71181015443030", 13.45, 2e9
+Q.invis = { track = nil, hum = nil }
+function Q.invisStop()
+  local inv = Q.invis
+  if inv.track then pcall(function() inv.track:Stop(0) end) end
+  inv.track, inv.hum = nil, nil
+end
+function Q.invisTick()
+  local _, hum = body(LP)
+  if not S.invisible or not hum or hum.Health <= 0 then Q.invisStop(); return end
+  local inv = Q.invis
+  -- a new body, or something stopped the track: play it again at once
+  if inv.hum == hum and inv.track and inv.track.IsPlaying then return end
+  Q.invisStop()
+  local animator = hum:FindFirstChildOfClass("Animator")
+  if not animator then return end
+  local anim = Instance.new("Animation")
+  anim.AnimationId = Q.INVIS_ANIM
+  local ok, track = pcall(animator.LoadAnimation, animator, anim)
+  if not ok or not track then return end
+  track.Priority = Enum.AnimationPriority.Action4
+  track:Play(0, Q.INVIS_WEIGHT, 0)
+  track.TimePosition = Q.INVIS_AT
+  inv.track, inv.hum = track, hum
+end
+L.hold(RS.Heartbeat:Connect(function()
+  if not L.live() then return end
+  local ok, err = pcall(Q.invisTick)
+  if not ok then L.fault("stand.invisible", err) end
+end))
+L.cleanup(function() Q.invisStop() end, 60)
+
+-- The stand beacon. The latch alone could not tell a stand that was not
+-- latched right then -- just loaded, off, flinging, respawning, or waiting out
+-- the owner's death -- from any other player, so `.a` could pick the other
+-- stand. A playing animation track replicates with its weight and time
+-- (measured 2026-10-14: another client read weight 1.000, time 7.350, speed 0
+-- exactly; a weight of 0.001 never arrived), so every stand plays one frozen
+-- track whose time encodes its owner. It has to be its own animation: two
+-- tracks of one animation reach other clients as one (measured: with the
+-- invisible track up, the other stand saw only that one). This is TSB's own
+-- "Cubes" effect animation (13.7 s): it drives effect parts, not a character's
+-- joints, so on a body it moves nothing at all.
+Q.BEACON_ANIM, Q.BEACON_BASE, Q.BEACON_STEP, Q.BEACON_CODES = "rbxassetid://73774110840260", 0.5, 0.03, 400
+Q.beacon = { track = nil, hum = nil, code = nil }
+function Q.beaconCode()
+  local name = (S.owner and S.owner.Name) or S.ownerName or ""
+  if name == "" then return nil end
+  local h = 0
+  for i = 1, #name do h = (h * 31 + string.byte(name:lower(), i)) % 1000003 end
+  return h % Q.BEACON_CODES
+end
+function Q.beaconStop()
+  local b = Q.beacon
+  if b.track then pcall(function() b.track:Stop(0) end) end
+  b.track, b.hum, b.code = nil, nil, nil
+end
+function Q.beaconTick()
+  local _, hum = body(LP)
+  local code = Q.beaconCode()
+  if not hum or hum.Health <= 0 or not code then Q.beaconStop(); return end
+  local b = Q.beacon
+  if b.hum == hum and b.track and b.track.IsPlaying and b.code == code then return end
+  Q.beaconStop()
+  local animator = hum:FindFirstChildOfClass("Animator")
+  if not animator then return end
+  local anim = Instance.new("Animation")
+  anim.AnimationId = Q.BEACON_ANIM
+  local ok, track = pcall(animator.LoadAnimation, animator, anim)
+  if not ok or not track then return end
+  track.Priority = Enum.AnimationPriority.Core
+  track:Play(0, 1, 0)
+  track.TimePosition = Q.BEACON_BASE + code * Q.BEACON_STEP
+  b.track, b.hum, b.code = track, hum, code
+end
+-- Another player's beacon code, or nil if they are not running a stand.
+function Q.beaconOf(player)
+  local _, hum = body(player)
+  local animator = hum and hum:FindFirstChildOfClass("Animator")
+  if not animator then return nil end
+  for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+    local a = t.Animation
+    if a and a.AnimationId == Q.BEACON_ANIM and t.WeightTarget > 0.5 and t.WeightTarget < 2 then
+      return math.floor((t.TimePosition - Q.BEACON_BASE) / Q.BEACON_STEP + 0.5)
+    end
+  end
+  return nil
+end
+L.hold(RS.Heartbeat:Connect(function()
+  if not L.live() then return end
+  local ok, err = pcall(Q.beaconTick)
+  if not ok then L.fault("stand.beacon", err) end
+end))
+L.cleanup(function() Q.beaconStop() end, 60)
+
 local function step(dt)
   local _, _, ownerRoot = body(S.owner)
   if ownerRoot then S.lastOwnerFrame = ownerRoot.CFrame end
+  local now = os.clock()
   if S.mode == "off" then
     if S.active then release("off") end
     if S.voidReady then wantVoid(false) end
     S.blocked, S.yield = nil, nil
+    -- keep knowing who the other stands are, so the first `.a` never picks one
+    if now - S.squadAt >= 0.25 then S.squadAt = now; refreshSquad() end
     return
   end
-  local now = os.clock()
   S.slotFrozen = S.mode == "attacking" and Q.selfLocked()
   -- Who else is standing here, ten times a second: joins, deaths and leaves
   -- re-pack the fan, and a squadmate's locked move is noticed within a frame
@@ -2117,6 +2316,103 @@ function Q.watchOwnGrab(now)
   end
 end
 
+-- The hunt, as one repeating cycle: a forward dash, four M1s, then the next
+-- move in the rotation. With every move cooling the move step is skipped, so
+-- it runs dash + four M1s until one comes back. The owner's own slot requests
+-- still jump the queue at any step.
+local CYCLE_M1S, DASH_RESEND, DASH_GIVE_UP, DASH_TRAVEL, M1_SEEN = 4, 0.3, 1.2, 0.25, 0.6
+local function newCycle() return { phase = "dash", at = os.clock(), hits = 0, dashSent = 0 } end
+S.newCycle = newCycle
+S.cycle = newCycle()
+
+local function cycleNext(c, phase, now)
+  c.phase, c.at, c.hits, c.dashSent, c.dashSeen, c.dashMark, c.swingAt = phase, now, 0, 0, nil, nil, nil
+end
+
+local function huntCycle(now, adapter, slots, aim)
+  local c = S.cycle
+  -- A skill that has not been taken yet is re-sent until its cooldown shows.
+  if S.pending then
+    local slot = slots[S.pending.slot]
+    if slot and slot.cooling then
+      S.lastSkillAt, S.lastSkillName = now, slot.name
+      S.rotation = S.pending.slot % 4 + 1
+      if S.requests[S.pending.slot] then S.requests[S.pending.slot] = nil end
+      S.pending = nil
+      if c.phase == "skill" then cycleNext(c, "dash", now) end
+    elseif now - S.pending.sentAt >= RESEND then
+      adapter.Wire.skill(S.pending.slot)
+      S.pending.sentAt = now
+    end
+    return
+  end
+
+  -- the owner asked for a slot: that goes first, whatever step we are on
+  local requested
+  for index, request in pairs(S.requests) do
+    if not requested or request.at < S.requests[requested].at then requested = index end
+  end
+  if requested then
+    local index = chooseSlot(slots, now, false)
+    if index then
+      S.requests[index].sent = true
+      adapter.Wire.skill(index)
+      S.lastSkillAt, S.lastSkillName = now, slots[index] and slots[index].name
+      S.pending = { slot = index, at = now, sentAt = now }
+      return
+    end
+  end
+
+  local char = LP.Character
+  if c.phase == "dash" then
+    if not S.dashSpam then cycleNext(c, "m1", now); return end
+    -- JustForwardDashed is a timestamp that never clears (measured 2026-10-13):
+    -- our dash landed only when it changes from what it was at this step's start.
+    local mark = char and char:GetAttribute("JustForwardDashed")
+    if c.dashMark == nil then c.dashMark = mark or false end
+    if not c.dashSeen and mark and mark ~= c.dashMark then c.dashSeen = now end
+    if c.dashSeen then
+      if now - c.dashSeen >= DASH_TRAVEL then cycleNext(c, "m1", now) end
+      return
+    end
+    -- still on TSB's dash cooldown: give up on it and go straight to the fists
+    if now - c.at >= DASH_GIVE_UP then cycleNext(c, "m1", now); return end
+    if now - lastDash >= DASH_RESEND then
+      adapter.Wire.dash(Enum.KeyCode.W, aim)
+      lastDash, c.dashSent = now, c.dashSent + 1
+    end
+    return
+  end
+
+  if c.phase == "m1" then
+    if not S.useM1 or c.hits >= CYCLE_M1S then cycleNext(c, "skill", now); return end
+    local ready = char and char:GetAttribute("M1Ready")
+    -- A swing counts once the game takes it (M1Ready drops), or after a short
+    -- wait for kits that never set the attribute.
+    if c.swingAt then
+      if ready == false or now - c.swingAt >= M1_SEEN then c.hits, c.swingAt = c.hits + 1, nil end
+      return
+    end
+    if aim and ready ~= false and now - lastM1 >= 0.12 then
+      adapter.Wire.m1(aim)
+      lastM1, c.swingAt = now, now
+    end
+    return
+  end
+
+  -- the move step: the rotation's next ready move, or straight back to the dash
+  if S.autoUlt and adapter.Game.ultimateReady() and now - lastUlt > 2 then
+    adapter.Wire.ult(); lastUlt = now
+    cycleNext(c, "dash", now)
+    return
+  end
+  local index = S.useSkills and nextReady(slots) or nil
+  if not index then cycleNext(c, "dash", now); return end
+  adapter.Wire.skill(index)
+  S.lastSkillAt, S.lastSkillName = now, slots[index] and slots[index].name
+  S.pending = { slot = index, at = now, sentAt = now }
+end
+
 local function combat()
   local now = os.clock()
   if S.mode == "attacking" then
@@ -2201,10 +2497,9 @@ local function combat()
     S.lastCombo = now   -- refused (no owner, no void gate): wait out the interval
   end
 
-  -- Dashes run on their own clock, weaving between and around every move. One
-  -- still on TSB's cooldown is simply refused, so trying often costs nothing.
-  if S.dashSpam and (attacking or (fronting and S.barrage)) and now - lastDash >= S.dashGap then
-    adapter.Wire.dash(Enum.KeyCode.W, aim) -- forward: straight at the target's back
+  -- The barrage keeps the free-running dash; the hunt dashes inside its cycle.
+  if S.dashSpam and fronting and S.barrage and now - lastDash >= S.dashGap then
+    adapter.Wire.dash(Enum.KeyCode.W, aim)
     lastDash = now
   end
 
@@ -2212,6 +2507,8 @@ local function combat()
     local health = other.health and other.maxHealth and other.health / other.maxHealth * 100 or 100
     if health <= S.flingBelow or (other.ragdoll and not nextReady(slots)) then flingNow(S.target); return end
   end
+
+  if attacking then return huntCycle(now, adapter, slots, aim) end
 
   -- A skill that has not been taken yet is re-sent until its cooldown shows.
   if S.pending then
@@ -2298,6 +2595,8 @@ function S.free(why)
 end
 
 local function pickTarget(query)
+  -- a fresh roster first: the other stands must be known before anyone is picked
+  refreshSquad()
   local target, why
   if query and query ~= "" then target, why = findPlayer(query, { [LP] = true, [S.owner] = true })
   else target = nearestToOwner() end
@@ -2321,6 +2620,7 @@ function S.attack(query)
   -- Each stand starts the rotation on its own slot, so a squad opening on one
   -- target does not fire four copies of the same move into the same frame.
   S.rotation, S.pending = (S.strikeSlot - 1) % 4 + 1, nil
+  S.cycle = newCycle()
   S.lastCombo = -math.huge
   say(S.lines.attack)
   return true
@@ -2349,6 +2649,7 @@ local function carry(kind, query)
       S.engageAt = os.clock()
       refreshSquad()
       S.rotation, S.pending = (S.strikeSlot - 1) % 4 + 1, nil
+      S.cycle = newCycle()
     end
     -- A squad hunts them together and only the leader takes hold: the others
     -- keep hitting, and step aside the moment the leader has them.
@@ -2387,6 +2688,13 @@ function S.toggleBarrage()
   if S.mode == "attacking" then return false, "already attacking" end
   if S.mode ~= "summoned" then local ok, why = S.summon(); if not ok then return false, why end end
   S.barrage = not S.barrage
+  return true
+end
+
+function S.toggleInvisible(on)
+  if on == nil then S.invisible = not S.invisible else S.invisible = on == true end
+  saveFeat("invisible", S.invisible)
+  say(S.invisible and "Going unseen." or "Visible again.")
   return true
 end
 
@@ -2547,6 +2855,10 @@ command({ "stop" }, "", "stop attacking or punching and come back", function() S
 command({ "1", "2", "3", "4" }, "", "use that skill now, on the target or in front of you", function(_, word) S.skill(tonumber(word)) end)
 command({ "m1" }, "", "punch barrage in front of you; say it again to stop", function() S.toggleBarrage() end)
 command({ "dash" }, "", "turn dash spam on or off", function() S.toggleDash() end)
+command({ "invis", "invisible" }, "[on|off]", "everyone else sees the stand's body thrown far under the map; it still hits", function(rest)
+  rest = tostring(rest or ""):lower()
+  S.toggleInvisible(rest == "on" and true or rest == "off" and false or nil)
+end)
 command({ "ult" }, "", "awaken when the bar is full", function() S.ult() end)
 command({ "b", "bring" }, "name", "take hold of that player and carry them to you", function(rest) S.bring(rest) end)
 command({ "v", "void" }, "name", "take hold of that player and carry them under the kill plane", function(rest) S.voidDrop(rest) end)
@@ -2560,7 +2872,11 @@ end)
 command({ "auto" }, "", "find the other stands by themselves and take a slot each", function() S.toggleAuto() end)
 command({ "fan" }, "ring | arc", "spread all the way round, or keep everyone near one angle", function(rest) S.setFan(rest) end)
 command({ "squad" }, "[name, name]", "name other stands by hand; blank clears the list", function(rest) S.setSquad(rest) end)
-command({ "fling" }, "[name]", "one Rep Root fling; the current target if blank", function(rest) S.fling(rest) end)
+command({ "f", "fling" }, "[name]", "fling them once; the current target if blank", function(rest, word)
+  -- with no prefix, a bare "f" is just chat, not an order
+  if word == "f" and rest == "" and (S.prefix or "") == "" then return end
+  S.fling(rest)
+end)
 command({ "pose" }, "right | left | behind | above", "where the stand waits beside you", function(rest) S.side(rest) end)
 command({ "say" }, "text", "make the stand talk", function(rest) say(rest, true) end)
 -- Built from the table itself, so commands added later (.gui, .black) are listed.
@@ -3107,7 +3423,7 @@ function S.build(win)
     min = 0, max = 90, step = 1, default = S.lowHP, callback = function(v) if finite(v) then S.lowHP = v end end })
 
   C.section(page, "fling assist")
-  C.paragraph(page, "Optional, off by default. Hands the target to Giorgio's Rep Root fling (your Rep Root drive and void-aim settings) for one short burst, then comes straight back and restores your Rep Root settings. Measured in TSB on 2026-09-23: the handover works, but the Rep Root fling itself moved the target 0 studs/s, with or without the stand, so for now this adds nothing in TSB.")
+  C.paragraph(page, "Optional, off by default. The stand lets go of its latch, sits inside the target with a huge velocity for one short burst until they are thrown, then latches straight back.")
   C.toggle(page, { id = "stand.flingAssist", text = "Fling assist", default = S.flingAssist,
     callback = function(v) S.flingAssist = v == true end })
   C.slider(page, { id = "stand.flingBelow", text = "Fling when target health is below %", desc = "Also flings a knocked-down target once every skill is cooling",
@@ -3312,7 +3628,7 @@ do
   end
 
   for _, fn in ipairs({ "setOwner", "setPrefix", "summon", "dismiss", "stop", "free", "attack", "bring",
-    "voidDrop", "skill", "toggleBarrage", "toggleDash", "ult", "angle", "setApproach", "setFacing",
+    "voidDrop", "skill", "toggleBarrage", "toggleDash", "toggleInvisible", "fling", "ult", "angle", "setApproach", "setFacing",
     "setFan", "setSquad", "toggleAuto", "side", "setHuntDistance" }) do
     Core[fn] = function(...) return S[fn](...) end
   end
@@ -3470,8 +3786,8 @@ do
   end)
 
   -- ------------------------------------------------------------ the console
-  -- Off by default. ".gui" (from the owner's chat, or typed by the operator)
-  -- or _G.GUI = true opens it; the build that carries a console sets
+  -- On by default. _G.GUI = false keeps it shut; ".gui" (from the owner's
+  -- chat, or typed by the operator) opens or closes it; the build that carries a console sets
   -- Core.startUI. Its fonts and icons come from the executor's workspace, and
   -- with _G.ASSETS set to a raw folder URL they are fetched there on first open.
   local ASSET_ROOT = "StandDosCintoes"
@@ -5487,6 +5803,8 @@ do
     U.button(row2, { text = "Attack", icon = "swords", style = "danger", onClick = function() U.act("attack", target:get()) end, tip = ".a name" })
     U.button(row2, { text = "Bring", icon = "hand", onClick = function() U.act("bring", target:get()) end, tip = ".b name  ·  a grab, delivered to the owner" })
     U.button(row2, { text = "Void", icon = "arrow-down", onClick = function() U.act("voidDrop", target:get()) end, tip = ".v name  ·  a grab, carried past the kill plane" })
+    U.button(row2, { text = "Fling", icon = "wind", onClick = function() U.act("fling", target:get()) end, tip = Core.S.prefix .. "f name  ·  the current target if blank" })
+    U.button(row2, { text = "Invisible", icon = "eye", onClick = function() U.act("toggleInvisible") end, tip = Core.S.prefix .. "invis  ·  body hidden from everyone else" })
     local row3 = U.hstack(act, 8)
     for i = 1, 4 do U.button(row3, { text = tostring(i), size = UDim2.fromOffset(40, 32), onClick = function() U.act("skill", i) end, tip = "." .. i }) end
     U.button(row3, { text = "Barrage", icon = "zap", onClick = function() U.act("toggleBarrage") end, tip = ".m1" })
@@ -5841,6 +6159,8 @@ do
         onChange = function(v) U.setting("dashGap", v, "dashGap", "dash gap") end })
     end
     flag("Awaken automatically", "Fires the awakening when the bar is full during an attack.", "autoUlt", "autoUlt")
+    flag("Invisible", "Revenant-style: everyone else sees the body thrown far under the map while the stand keeps hitting.", "invisible", "invisible")
+    flag("Fling assist", "Flings the target once it is low or knocked down with every move cooling.", "flingAssist", "flingAssist")
 
     U.watch("st", function(st)
       local slots = st and st.slots
@@ -6395,6 +6715,8 @@ do
     add("Barrage in front", ".m1", "zap", function() U.act("toggleBarrage") end)
     add("Awaken", ".ult", "flame", function() U.act("ult") end)
     add("Dash spam on / off", ".dash", "wind", function() U.act("toggleDash") end)
+    add("Invisible on / off", ".invis", "eye", function() U.act("toggleInvisible") end)
+    add("Fling the current target", Core.S.prefix .. "f", "wind", function() U.act("fling", "") end)
     for i = 1, 4 do add("Skill " .. i, "." .. i, "sword", function() U.act("skill", i) end) end
     add(U.S.showcase and "Showcase off" or "Showcase on", "simulated data", "play", function() U.setShowcase(not U.S.showcase) end)
     add("Undo last change", "Ctrl+Z", "undo-2", function() U.undo() end)
