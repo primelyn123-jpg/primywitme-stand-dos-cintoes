@@ -14,5 +14,5 @@ _G.FOLLOW_SPEED      = 1        -- 1 = snaps beside you, lower = smoother
 _G.OFFSET_RIGHT      = 3        -- idle spot beside you
 _G.OFFSET_UP         = 2.5
 _G.OFFSET_BACK       = 4
-_G.ASSETS            = "https://raw.githubusercontent.com/Mrzaytoon/stand-dos-cintoes/main/StandDosCintoes/"
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Mrzaytoon/stand-dos-cintoes/main/Stand-dos-Cintoes.lua"))()
+_G.ASSETS            = "https://raw.githubusercontent.com/primywitme/stand-dos-cintoes/main/StandDosCintoes/"
+loadstring(game:HttpGet("https://raw.githubusercontent.com/primywitme/stand-dos-cintoes/main/Stand-dos-Cintoes.lua"))()

@@ -95,7 +95,7 @@ end
 -- standcore/loader.lua, baked in here by the build. So a bare loadstring with
 -- only the host set runs exactly the config the loader spells out, and so does
 -- everyone else. A saved setting or a _G line still wins over these.
-local DEFAULTS = { PREFIX = ".", MESSAGES = false, GUI = true, BLACK_SCREEN = true, ANTI_AFK = true, HUNT_DISTANCE = 7.4, HUNT_FROM = "Behind", MAX_STANDS = 4, YIELD = true, HUNT_WITHOUT_HOST = true, FOLLOW_SPEED = 1, OFFSET_RIGHT = 3, OFFSET_UP = 2.5, OFFSET_BACK = 4, ASSETS = "https://raw.githubusercontent.com/Mrzaytoon/stand-dos-cintoes/main/StandDosCintoes/" }
+local DEFAULTS = { PREFIX = ".", MESSAGES = false, GUI = true, BLACK_SCREEN = true, ANTI_AFK = true, HUNT_DISTANCE = 7.4, HUNT_FROM = "Behind", MAX_STANDS = 4, YIELD = true, HUNT_WITHOUT_HOST = true, FOLLOW_SPEED = 1, OFFSET_RIGHT = 3, OFFSET_UP = 2.5, OFFSET_BACK = 4, ASSETS = "https://raw.githubusercontent.com/primywitme/stand-dos-cintoes/main/StandDosCintoes/" }
 local HOUSE = {}
 Core.defaults = DEFAULTS
 function Cfg.feat(id, default)
