@@ -2855,9 +2855,12 @@ command({ "stop" }, "", "stop attacking or punching and come back", function() S
 command({ "1", "2", "3", "4" }, "", "use that skill now, on the target or in front of you", function(_, word) S.skill(tonumber(word)) end)
 command({ "m1" }, "", "punch barrage in front of you; say it again to stop", function() S.toggleBarrage() end)
 command({ "dash" }, "", "turn dash spam on or off", function() S.toggleDash() end)
-command({ "invis", "invisible" }, "[on|off]", "everyone else sees the stand's body thrown far under the map; it still hits", function(rest)
+command({ "i", "invis", "invisible" }, "[on|off]", "invisible on or off: everyone else sees the body thrown far under the map; it still hits", function(rest)
   rest = tostring(rest or ""):lower()
-  S.toggleInvisible(rest == "on" and true or rest == "off" and false or nil)
+  -- explicit: `x == "off" and false or nil` is nil in Lua, which toggled instead
+  if rest == "on" then S.toggleInvisible(true)
+  elseif rest == "off" then S.toggleInvisible(false)
+  else S.toggleInvisible() end
 end)
 command({ "ult" }, "", "awaken when the bar is full", function() S.ult() end)
 command({ "b", "bring" }, "name", "take hold of that player and carry them to you", function(rest) S.bring(rest) end)
@@ -5804,7 +5807,20 @@ do
     U.button(row2, { text = "Bring", icon = "hand", onClick = function() U.act("bring", target:get()) end, tip = ".b name  ·  a grab, delivered to the owner" })
     U.button(row2, { text = "Void", icon = "arrow-down", onClick = function() U.act("voidDrop", target:get()) end, tip = ".v name  ·  a grab, carried past the kill plane" })
     U.button(row2, { text = "Fling", icon = "wind", onClick = function() U.act("fling", target:get()) end, tip = Core.S.prefix .. "f name  ·  the current target if blank" })
-    U.button(row2, { text = "Invisible", icon = "eye", onClick = function() U.act("toggleInvisible") end, tip = Core.S.prefix .. "invis  ·  body hidden from everyone else" })
+    -- A real toggle: it reads the stand's own setting, so `.i` from chat or the
+    -- settings page flips it too and it always shows what is actually on.
+    local invisButton = U.button(row2, { text = "Invisible: off", icon = "eye", onClick = function() U.act("toggleInvisible") end,
+      tip = Core.S.prefix .. "i  ·  body hidden from everyone else" })
+    local invisShown
+    local function paintInvis()
+      local on = Core.S.invisible == true
+      if on == invisShown then return end
+      invisShown = on
+      invisButton:setText(on and "Invisible: ON" or "Invisible: off")
+      invisButton:setColor(on and c.auraDeep or c.panel2)
+    end
+    paintInvis()
+    U.watch("st", paintInvis, invisButton.inst)
     local row3 = U.hstack(act, 8)
     for i = 1, 4 do U.button(row3, { text = tostring(i), size = UDim2.fromOffset(40, 32), onClick = function() U.act("skill", i) end, tip = "." .. i }) end
     U.button(row3, { text = "Barrage", icon = "zap", onClick = function() U.act("toggleBarrage") end, tip = ".m1" })
@@ -6159,8 +6175,15 @@ do
         onChange = function(v) U.setting("dashGap", v, "dashGap", "dash gap") end })
     end
     flag("Awaken automatically", "Fires the awakening when the bar is full during an attack.", "autoUlt", "autoUlt")
-    flag("Invisible", "Revenant-style: everyone else sees the body thrown far under the map while the stand keeps hitting.", "invisible", "invisible")
-    flag("Fling assist", "Flings the target once it is low or knocked down with every move cooling.", "flingAssist", "flingAssist")
+    for _, e in ipairs({
+      { "Invisible", "Revenant-style: everyone else sees the body thrown far under the map while the stand keeps hitting. " .. S.prefix .. "i in chat.", "invisible" },
+      { "Fling assist", "Flings the target once it is low or knocked down with every move cooling.", "flingAssist" },
+    }) do
+      local _, r = U.row(set, e[1], e[2])
+      local t = U.toggle(r, { value = S[e[3]] == true, onChange = function(v) U.setting(e[3], v, e[3], e[1]) end })
+      -- follows chat commands and the settings page
+      U.watch("st", function() t:set(S[e[3]] == true, true) end, t.inst)
+    end
 
     U.watch("st", function(st)
       local slots = st and st.slots
@@ -6562,6 +6585,23 @@ do
     flag("Take orders from the owner", "Only the owner's chat is ever read.", "listen", "listen")
     flag("Stand speaks", "Short replies in chat. One line a second at most; a newer line replaces a queued one.", "speak", "speak")
 
+    card("invisible and fling")
+    do
+      -- live toggles: `.i` in chat or the deck's button flips them here too
+      local function liveFlag(label, note, key)
+        local t = U.toggle(row(label, note), { value = S[key] == true, onChange = function(v) U.setting(key, v, key, label) end })
+        U.watch("st", function() t:set(S[key] == true, true) end, t.inst)
+      end
+      liveFlag("Invisible", "Everyone else sees the stand's body thrown far under the map; its root keeps fighting and hitting. Measured: hidden in 97 of 104 samples. Chat: " .. S.prefix .. "i, or " .. S.prefix .. "i on / off.", "invisible")
+      liveFlag("Fling assist", "During a hunt, flings the target once its health drops below the line below, or when it is knocked down with every move cooling.", "flingAssist")
+      num("Fling when health below", "Percent of the target's health.", "flingBelow", "flingBelow", 1, 100, 1, 40, function(v) return U.fmt(v) .. "%" end)
+      num("Seconds between flings", "The assist waits this long before flinging again.", "flingEvery", "flingEvery", 2, 60, 0.5, 10)
+      num("Fling length", "How long one fling pushes before it gives up (it stops early once they are thrown).", "flingDrive", "flingDrive", 0.3, 6, 0.05, 2.5,
+        function(v) return U.fmt(v, 2) .. " s" end)
+      U.button(row("Fling now", "The current target, or the name typed on the deck. Chat: " .. S.prefix .. "f name."),
+        { text = "Fling", icon = "wind", onClick = function() U.act("fling", "") end })
+    end
+
     card("pose and look")
     U.dropdown(row("Idle stance", "TSB's own emote idles, each load-tested. Aka Stance, Those Who Know, Take Me On and Superhero load with length 0 and are left out."),
       { items = STANCES, value = S.stance, size = UDim2.fromOffset(250, 32), onChange = function(v) U.setting("stance", v, "stance", "idle stance") end })
@@ -6715,7 +6755,7 @@ do
     add("Barrage in front", ".m1", "zap", function() U.act("toggleBarrage") end)
     add("Awaken", ".ult", "flame", function() U.act("ult") end)
     add("Dash spam on / off", ".dash", "wind", function() U.act("toggleDash") end)
-    add("Invisible on / off", ".invis", "eye", function() U.act("toggleInvisible") end)
+    add("Invisible on / off", Core.S.prefix .. "i", "eye", function() U.act("toggleInvisible") end)
     add("Fling the current target", Core.S.prefix .. "f", "wind", function() U.act("fling", "") end)
     for i = 1, 4 do add("Skill " .. i, "." .. i, "sword", function() U.act("skill", i) end) end
     add(U.S.showcase and "Showcase off" or "Showcase on", "simulated data", "play", function() U.setShowcase(not U.S.showcase) end)
